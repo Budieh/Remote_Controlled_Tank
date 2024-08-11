@@ -1,0 +1,23 @@
+Circuit: * C:\Users\User\Desktop\Proiect PM\LtSpice Models\RelayControlCircuit\RelayControlCircuit.asc
+
+Limiting rise time of source v§signal to 0.1
+Limiting fall time of source v§signal to 0.1
+Direct Newton iteration for .op point succeeded.
+
+Date: Sun Jun 30 14:15:41 2024
+Total elapsed time: 0.117 seconds.
+
+tnom = 27
+temp = 27
+method = modified trap
+totiter = 4957
+traniter = 4940
+tranpoints = 1848
+accept = 1594
+rejected = 254
+matrix size = 21
+fillins = 0
+solver = Normal
+Matrix Compiler1: 1.29 KB object code size  0.6/0.4/[0.3]
+Matrix Compiler2: off  [0.3]/0.8/0.5
+

@@ -1,0 +1,67 @@
+I) Masurare:
+
+1) Caracteristici generale motor + encoder:
+--> Tensiune de alimentare : 7.5 V
+--> Raport reductor : 150 : 1
+--> Citiri encoder / rotatie motor : 14
+--> Tensiune alimentare encode : 3.3 V
+
+2) Comanda:
+
+Tensiune analogica ( potentiometru ):
+--> Valoare minima tensiune potentiometru : 1.4 V
+--> Valoare maxima tensiune potentiometru : 4 V
+! Pentru comenzi mai mici decat valoarea minima motorul nu reuseste sa porneasca, neputand invinge frecarile statice.
+! De la comenzi mai mari decat valoarea maxima motorul intra in saturatie, nereusind sa ajunga la o turatie mai mare. 
+
+Tensiune generata cu semnal PWM ( frecventa de 16 kHz ):
+--> Valoare minima tensiune ( medie ) : 1.8 V <=> factor de umplere de 36 % 
+--> Valoare maxima tensiune ( medie ) : 3.8 V <=> factor de umplere de 76 %
+! Pentru comenzi mai mici decat valoarea minima motorul nu reuseste sa porneasca, neputand invinge frecarile statice.
+! De la comenzi mai mari decat valoarea maxima motorul intra in saturatie, nereusind sa ajunga la o turatie mai mare. 
+
+Caracteristica statica a motorului:
+--> S-a reprezentat caracteristica statica a motorului pentru o succesiune de intrari reprezentate de factorii de umplere ale semnalelor PWM aplicate la intrarea driverului motorului ( de
+la 30 % pana la 100 %, cu pasul de 2 % ), masurandu-se valoarea ( in regim stationar ) a turatiei motorului pentru intrarile date.
+--> S-a determinat ca motorul are o caracteristica ( aproximativ ) liniara pentru intrari in intervalul 38 % - 74 %, alegandu-se punctul static de functionare al acestuia la valoarea intrarii de 58%, valoare in care turatia motorului este de 35.873 RPM.
+--> In regiunea de functionare ( aproximativ ) liniara, turatia motorului poate fi determinata pe baza factorului de umplere al PWM-ului utilizand ecuatia de ordinul I data de parametrii:
+    Panta : 1.2937 [ V / RPM ]
+    Offset : 10 - 38 * 1.2937 [ V ]
+
+II) Identificare:
+
+1) Functia de transfer a motorului:
+
+--> Pentru a determina functia de transfer a motorului, se va aplica o treapta de valoare 60 % [ corespondenta cu o valoare a turatiei de aprxoimativ 38.46 RPM ] pentru a vedea forma raspunsului motorului la aceasta treapta.
+--> In urma simularii raspunsului sistemului, pentru o referinta de tip treapta de amplitudine 38.46 RPM, s-a obtinut urmatoarea caracteristica:
+    -Forma unei functii de transfer de ordinul I
+    -Valoarea de regim stationar : 37.2 RPM => atenuare Kp = 37.2 / 38.46 = 0.9672386985 [ adimensional ]
+    -Timp tranzitoriu: de la 0.15 pana la 1.15, deci 1 secunda, constanta de timp Tp fiind egala cu timpul tranzitoriu / 3 => Tp = 1 / 3 = 0.3334 [ secunde ] 
+    !Nu se prezinta suprareglaj, fluctuatiile din regim stationar fiind determinate de perturbatii de masurare
+    !Nu se prezinta timp mort, raspunsul aparent intarziat al sistemului fiind cauzat de modul in care programul ( secvential ) de test realizeaza scrierea bufferului ce contine vitezele
+--> Deci, functia de transfer a sistemului este: Kp / ( Tp * s + 1 ), cele doua constante fiind determinate mai sus. In continuare, vom proiecta un regulator PI pentru aceasta utilizand metoda poli-zerouri.
+
+III) Reglare:
+
+1) Proiectare regulator ( PI ):
+
+--> In urma impunerii unor performante dorite si a proiectarii analitice utilizand metoda poli-zeouri, s-a ajuns la urmatoarea forma a regulatorului: Kr( 1 + 1/ (Ti * s)),
+unde Kr = 0.6894 [ adimensiunal ] si Ti = 0.3334 [ s ], regulator din clasa PI. Urmatorul pas consta in discretizarea acestui regulator.
+
+2) Discretizare regulator:
+--> Prima incercare de discretizare s-a realizat utilizand metoda Euler, ceea ce a condus la intrarea sistemului in instabilitate, fapt ce a condus la utilizarea metodei
+Tustin, ce asigura stabilitatea functiei de transfer discrete obtinuta de la o functie de transfer continua ( mai multe explicatii in calculele atasate mai jos ).
+--> In urma utilizarii metodei Tustin cu o perioada de esantionare de 50 ms = 0.05 s, s-a obtinut urmatoarea functie de transfer: (0.7410 - 0.6377 * z^(-1)) / (1 - z^(-1))
+si, stiind ca intrarea regulatorului este eroarea iar iesirea acestuia este comanda, in urma efectuarii calculelor ( atasate mai jos ) se obtine ecuatia cu diferente: 
+u[k] = u[k-1] + 0.7410 * e[k] + (-0.6377) * e[k-1], unde 'e[]' reprezinta eroarea ( discretizata ), 'u[]' reprezinta comanda ( discretizata ), 'k' reprezinta momentul de 
+timp ( discret ) curent iar 'k-1' momentul de timp discret precedent.
+
+3) Concluzii:
+--> Observam ca, in urma aplicarii regulatorului, mototrul raspunde dinamic la sarcina, modificand comanda pentru a-si mentine turatia la valoarea setata.
+
+4) Calcule atasate: ( se regasesc in versiunea word a acestui document )
+
+
+
+
+

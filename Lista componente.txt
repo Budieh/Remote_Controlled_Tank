@@ -1,0 +1,42 @@
+<<<<<<< HEAD
+--> Motor + encoder:
+    Micro Motor cu Reductor si Codor CGM12-N20VA-8200E (52 RPM la 3 V, 105 RPM la 6 V)
+    Link: https://www.optimusdigital.ro/ro/motoare-micro-motoare-cu-reductor/2937-micro-motor-cu-reductor-i-codor-cgm12-n20va-8200e-52-rpm-la-3-v-105-rpm-la-6-v.html?gad_source=1&gclid=Cj0KCQjw6PGxBhCVARIsAIumnWYpSAN-zhm_CepUXgYy_SawxXWm1adGOdN6IbQGAc_vaUiiMxXvcfQaAsm_EALw_wcB
+
+--> Driver motor:
+    Driver de Motoare DC PWM 6V-90V 15A
+    Link: https://www.optimusdigital.ro/ro/electronica-de-putere-drivere-de-motoare/13035-driver-de-motoare-dc-pwm-6v-90v-15a.html?search_query=driver&results=364   
+
+--> Modul Bluetooth:
+    CIP ID: CC2541
+    Wiki: https://w.electrodragon.com/w/CC2541
+    Producer website: www.bolutek.com
+
+--> Placa de dezvoltare:
+    NUCLEO-F070RB development board
+    Producer website: https://www.st.com/en/evaluation-tools/nucleo-f070rb.html
+    
+--> DC-DC Buck Converter:
+    Modul DC-DC Step Down LM2596HVS
+=======
+--> Motor + encoder:
+    Micro Motor cu Reductor si Codor CGM12-N20VA-8200E (52 RPM la 3 V, 105 RPM la 6 V)
+    Link: https://www.optimusdigital.ro/ro/motoare-micro-motoare-cu-reductor/2937-micro-motor-cu-reductor-i-codor-cgm12-n20va-8200e-52-rpm-la-3-v-105-rpm-la-6-v.html?gad_source=1&gclid=Cj0KCQjw6PGxBhCVARIsAIumnWYpSAN-zhm_CepUXgYy_SawxXWm1adGOdN6IbQGAc_vaUiiMxXvcfQaAsm_EALw_wcB
+
+--> Driver motor:
+    Driver de Motoare DC PWM 6V-90V 15A
+    Link: https://www.optimusdigital.ro/ro/electronica-de-putere-drivere-de-motoare/13035-driver-de-motoare-dc-pwm-6v-90v-15a.html?search_query=driver&results=364   
+
+--> Modul Bluetooth:
+    CIP ID: CC2541
+    Wiki: https://w.electrodragon.com/w/CC2541
+    Producer website: www.bolutek.com
+
+--> Placa de dezvoltare:
+    NUCLEO-F070RB development board
+    Producer website: https://www.st.com/en/evaluation-tools/nucleo-f070rb.html
+    
+--> DC-DC Buck Converter:
+    Modul DC-DC Step Down LM2596HVS
+>>>>>>> f81766b4cf5f1c354dd4042ff9771a53c057c107
+    Link: https://www.optimusdigital.ro/ro/surse-coboratoare-reglabile/13130-modul-dc-dc-step-down-lm2596hvs.html?gad_source=1&gclid=CjwKCAjw7NmzBhBLEiwAxrHQ-XU5vA-ZT9K3NJIriySdfqZ-iE1CdJ-uaz3XfoeJ00KXXrXxlEw9QRoC5n8QAvD_BwE

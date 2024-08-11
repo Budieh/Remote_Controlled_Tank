@@ -1,0 +1,627 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2024 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+// library containing various types of integer variables
+#include <stdint.h>
+// library containing functions for string manipulation
+#include <string.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+// number of encoder counts per rotation
+#define counts_per_rotation ((uint8_t) 14)
+// sampling period ( in milliseconds )
+#define sampling_period ((uint8_t) 50)
+// value used for conversion from counts to RPM
+#define counts_to_rpm (((float)(( 1e3 / sampling_period )) * 2 / 5) / counts_per_rotation)
+// address of the register that stores the duty value for the PWM signal
+#define PWM_Duty_Value_Register ((volatile uint16_t * )0x40014434)
+// gain for the current error ( used in the PI algorithm )
+#define current_gain ((float) 0.7410)
+// gain for the previous error ( used in the PI algorithm )
+#define previous_gain ((float) -0.6377)
+// slope value used for ( linear ) conversion from duty cycle to RPM
+#define slope ((float) 1.2937)
+// offset value used for ( linear ) conversion from duty cycle to RPM
+#define offset ((float) -39.1606)
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim16;
+
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+
+// variables used for motor readings
+// counter value at current reading
+uint16_t count;
+// counter value at previous reading
+uint16_t count_prev;
+// motor shaft rotation speed ( measured in RPM )
+float speed;
+// vector used for storing the speed readings of the motor
+float speed_vector[200];
+// index used for moving through the vector mentioned above
+uint8_t speed_index = 200;
+// buffer used for UART data communication
+uint8_t uart_buffer[10];
+// index used for moving through the UART buffer
+uint8_t uart_index;
+// variable that stores the vale of the set speed based on the PWM value
+float set_speed;
+//variable that stores the value of the previous speed error
+float error_prev;
+// variable that stores the value of the current speed error
+float error_curr;
+// variable that stores the command sent to the process at the current step
+float command_curr;
+// variable that stores the command sent to the process at the previous step
+float command_prev;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_TIM6_Init(void);
+static void MX_TIM16_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+// callback function that gets called when the motor does a full shaft rotation
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+	// timer 6 is the timer used for sampling the sensor readings
+	if(htim->Instance == TIM6)
+	{
+
+		// the counter stores the number of rising-edge and falling-edge transitions
+		// performed by Channel 1 and Channel 2 during a full rotation of the motor shaft
+		count = __HAL_TIM_GET_COUNTER(&htim3);
+
+		// variable that stores the difference between current count and previous count
+        int32_t diff = count - count_prev;
+
+        // if the difference is negative it means that the timer 3 counter performed an overflow
+		if( diff < 0 ) diff += 0x0000FFFF;
+
+	    // calculate current speed ( measured in RPM )
+	    speed = counts_to_rpm * diff;
+
+        ////////////////////////////////////////////////////////////////////////////////////////
+	    /* comment this part out if all you want to do is to test the process, this part is used
+	    for implementing the PI control algorithm */
+
+	    // calculate the current error between the set and actual speed
+	    error_curr = set_speed - speed;
+
+	    // calculate the value of the command ( in RPM )
+	    command_curr = command_prev + current_gain * error_curr + previous_gain * error_prev;
+
+	    // convert the command to duty cycle value and write it in the register that stores said value
+	    * PWM_Duty_Value_Register =  (uint16_t)(30 * ((command_curr - offset) / slope));
+
+	    // update the value of error_prev
+	    error_prev = error_curr;
+
+	    // update the value of command_prev
+	    command_prev = command_curr;
+
+        /* the part mentioned above ends here */
+	    ////////////////////////////////////////////////////////////////////////////////////////
+
+	    // populating the vector with speed readings ( for a total of 40 * 200 = 8000 milliseconds )
+	    if(speed_index < 200) speed_vector[speed_index++] = speed;
+
+	    // update count_prev variable with the value of count
+	    count_prev = count;
+	}
+}
+
+// callback function that gets called when a full message ( one byte ) has been received through UART
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	// UART 2 is being used to communicate with the terminal
+	if(huart->Instance == USART2)
+	{
+	    // if the last character in the buffer is newLine, it means the terminal sent a full message
+		// representing a duty cycle of the PWM
+	    if(*(uart_buffer + uart_index - 1) == '\n')
+	    {
+		    // convert data received from terminal into a PWM duty cycle
+		    uint16_t msg_to_duty = 10 * ((uint16_t)uart_buffer[0]) + ((uint16_t)uart_buffer[1]) - 528;
+	    	// if the duty cycle is situated in the linear region of operation, write it in the
+		    // corresponding register ( multiply it by 30 so that it scales with the PWM timer
+		    // period of 3000 ). Otherwise, we set the value of said register to 0 so that we don't
+		    // risk unwanted behavior from the motor.
+
+		    // based on the same observations, we modify the value of the set_speed parameter using the
+		    // first degree analytical relation obtained by linearization
+		    if(msg_to_duty >= 38 && msg_to_duty <= 74)
+		    {
+		       * PWM_Duty_Value_Register = msg_to_duty * 30;
+		       set_speed = ((float)( msg_to_duty )) * slope + offset;
+		    }
+		    else
+		    {
+		       * PWM_Duty_Value_Register = 0;
+		       set_speed = 0;
+		    }
+		    // reset the data buffer
+		    uart_index = 0;
+	    }
+	    // restart receiving data from the terminal
+	    if(UART_Start_Receive_IT(&huart2, uart_buffer + ( uart_index ++ ), 1) != HAL_OK )
+	    {
+		    Error_Handler();
+	    }
+	}
+}
+
+// callback function that gets called when the user button ( blue ) is pressed
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+	// the button associated with the user button is pin 13 from port C
+	if(GPIO_Pin == GPIO_PIN_13)
+	{
+		// static variable to determine the state of the user button
+		static uint8_t button_state;
+		// switch statement to implement a sequence of steps used to determine the response of
+		// the motor for a step reference
+		switch(button_state)
+		{
+
+		// set the PWM signal at 0% duty cycle so that the rotary shaft of the motor doesn't spin
+		case 0:
+		* PWM_Duty_Value_Register = 0;
+		// modifying set_speed is relevant only for closed loop testing, otherwise it doesn't
+		// have any effect on the simulation
+		// in case of closed loop, we modify the set speed so that it matches the value written in
+		// the PWM duty cycle register
+		set_speed = 0;
+		break;
+
+		// apply the step reference by setting the PWM signal at 60% duty cycle and set
+		// speed_index at 0 so the response starts getting captured in the speed vector
+		case 1:
+	    speed_index = 0;
+		* PWM_Duty_Value_Register = 60 * 30;
+		// same observation as the one present in the first case
+		set_speed =  ((float)( 60 )) * slope + offset;
+		break;
+
+		// reset the PWM signal at 0% duty cycle so that the rotor of the motor stops spinning
+		case 2:
+	    * PWM_Duty_Value_Register = 0;
+	    // same observation as the one present in the first case
+	    set_speed =  0;
+	    break;
+
+		// send the vector containing the response of the motor to the terminal through UART
+		case 3:
+	    for(uint8_t i = 0; i < 200; i++)
+        {
+	       sprintf(uart_buffer,"%.4f \0",*(speed_vector + i));
+	       if(HAL_UART_Transmit(&huart2,uart_buffer,strlen(uart_buffer),HAL_MAX_DELAY) != HAL_OK)
+	       {
+	    	  Error_Handler();
+	       }
+        }
+		break;
+		}
+
+		// if the button_state variable reaches value 4 then it has to be reset at value 0 so that
+		// the process can be performed again
+		button_state++;
+		if(button_state == 4) button_state = 0;
+	}
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_TIM3_Init();
+  MX_TIM6_Init();
+  MX_TIM16_Init();
+  /* USER CODE BEGIN 2 */
+
+  // start receiving data the terminal, one byte at a time
+  if(UART_Start_Receive_IT(&huart2, uart_buffer + ( uart_index ++ ), 1) != HAL_OK )
+  {
+	  Error_Handler();
+  }
+
+  if(HAL_TIM_PWM_Start(&htim16,TIM_CHANNEL_1) != HAL_OK)
+  {
+	  Error_Handler();
+  }
+
+  // starting Timer 3 in encoder mode
+  if(HAL_TIM_Encoder_Start(&htim3,TIM_CHANNEL_ALL) != HAL_OK)
+  {
+	  Error_Handler();
+  }
+
+  // starting Timer 6 in normal mode
+
+  if(HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
+   {
+ 	  Error_Handler();
+   }
+
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL6;
+  RCC_OscInitStruct.PLL.PREDIV = RCC_PREDIV_DIV1;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 65535;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI1;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = sampling_period - 1;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 48000;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
+  * @brief TIM16 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM16_Init(void)
+{
+
+  /* USER CODE BEGIN TIM16_Init 0 */
+
+  /* USER CODE END TIM16_Init 0 */
+
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM16_Init 1 */
+
+  /* USER CODE END TIM16_Init 1 */
+  htim16.Instance = TIM16;
+  htim16.Init.Prescaler = 0;
+  htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim16.Init.Period = 3000;
+  htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim16.Init.RepetitionCounter = 0;
+  htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim16) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim16, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim16, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM16_Init 2 */
+
+  /* USER CODE END TIM16_Init 2 */
+  HAL_TIM_MspPostInit(&htim16);
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 38400;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LD2_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI4_15_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_15_IRQn);
+
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+/* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

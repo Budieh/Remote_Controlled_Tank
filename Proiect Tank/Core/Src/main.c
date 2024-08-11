@@ -1,0 +1,1078 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2024 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+// for various integer sub-types
+#include <stdint.h>
+// library containing functions for string manipulation
+#include <string.h>
+// library containing general-purpose input/output functions
+#include <stdio.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+// Address of the register that stores the duty value for the PWM signals controlling the turret, motor1 and motor2
+
+# define PWM_Duty_Value_Register_Turret ((volatile uint16_t * )0x40014434)
+# define PWM_Duty_Value_Register_Motor1 ((volatile uint16_t * )0x40002034)
+# define PWM_Duty_Value_Register_Motor2 ((volatile uint16_t * )0x40014834)
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+// number of encoder counts per rotation
+#define counts_per_rotation ((uint8_t) 14)
+// sampling period ( in milliseconds )
+#define sampling_period ((uint8_t) 50)
+// value used for conversion from counts to RPM
+#define counts_to_rpm (((float)(( 1e3 / sampling_period )) * 2 / 5) / counts_per_rotation)
+// value used for scaling the duty cycle to the PWM timer period
+#define scale_to_period ((uint8_t) 30)
+// address of the register that stores the duty value for the PWM signal
+#define current_gain ((float) 0.7410)
+// gain for the previous error ( used in the PI algorithm )
+#define previous_gain ((float) -0.6377)
+// slope value used for ( linear ) conversion from duty cycle to RPM
+#define slope ((float) 1.2937)
+// offset value used for ( linear ) conversion from duty cycle to RPM
+#define offset ((float) -39.1606)
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim14;
+TIM_HandleTypeDef htim16;
+TIM_HandleTypeDef htim17;
+
+UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_TIM16_Init(void);
+static void MX_TIM6_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_TIM14_Init(void);
+static void MX_TIM17_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+// Buffer for data received through UART2 from the terminal
+static uint8_t RX_Buffer[20];
+// Index for the buffer mentioned above
+static uint8_t RX_Buffer_Index = 0;
+// Buffer for data sent through UART2 to the terminal
+static uint8_t TX_Buffer[30];
+// Buffer for data received through UART3 from the wireless device
+static uint8_t Bluetooth_RX_Buffer[35];
+// Index for the buffer mentioned above
+static uint8_t Bluetooth_RX_Buffer_Index = 0;
+// Buffer for data sent through UART3 to the wireless device
+static uint8_t Bluetooth_TX_Buffer[10];
+
+// Variable keeping track of the number of messages sent from the terminal
+static uint8_t nr_sent_messages = 0;
+// Semaphore variable used for loop-back of data sent from the terminal ( used for debugging purposes )
+static uint8_t TX_Semaphore = 0;
+// Variable used for cycling through a couple of pre-defined messages from the wireless device ( used in the user button
+// interrupt callback )
+static uint8_t message_nr = 0;
+
+// variables used for motor readings
+// counter value at current reading
+uint16_t count_motor1;
+uint16_t count_motor2;
+// counter value at previous reading
+uint16_t count_prev_motor1;
+uint16_t count_prev_motor2;
+// motor shaft rotation speed ( measured in RPM )
+float speed_motor1;
+float speed_motor2;
+// variable that stores the direction of rotation of the motor: 1 = forward , -1 = backwards
+int8_t direction_1 = 1;
+int8_t direction_2 = 1;
+// variable that stores the value of the set speed based on the PWM value
+float set_speed_motor1;
+float set_speed_motor2;
+// variable that stores the value of the previous speed error
+float error_prev_motor1;
+float error_prev_motor2;
+// variable that stores the value of the current speed error
+float error_curr_motor1;
+float error_curr_motor2;
+// variable that stores the command sent to the process at the current step
+float command_curr_motor1;
+float command_curr_motor2;
+// variable that stores the command sent to the process at the previous step
+float command_prev_motor1;
+float command_prev_motor2;
+
+// callback function that gets called when a full sampling period has passed
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+	// timer 6 is the timer used for sampling the sensor readings
+	if(htim->Instance == TIM6)
+	{
+
+		// the counter stores the number of rising-edge and falling-edge transitions
+		// performed by Channel 1 and Channel 2 during a full rotation of the motor shaft
+		count_motor1 = __HAL_TIM_GET_COUNTER(&htim1);
+		count_motor2 = __HAL_TIM_GET_COUNTER(&htim3);
+
+		// variable that stores the difference between current count and previous count
+        int32_t diff_motor1 = (((int32_t)count_motor1) - ((int32_t)count_prev_motor1)) * direction_1;
+        int32_t diff_motor2 = (((int32_t)count_motor2) - ((int32_t)count_prev_motor2)) * direction_2;
+
+        // if the difference is negative it means that the timer 3 counter performed an overflow
+		if( diff_motor1 < 0 ) diff_motor1 += 0x0000FFFF;
+		if( diff_motor2 < 0 ) diff_motor2 += 0x0000FFFF;
+
+	    // calculate current speed ( measured in RPM )
+	    speed_motor1 = counts_to_rpm * diff_motor1;
+	    speed_motor2 = counts_to_rpm * diff_motor2;
+
+	    // calculate the current error between the set and actual speed
+	    error_curr_motor1 = set_speed_motor1 - speed_motor1;
+	    error_curr_motor2 = set_speed_motor2 - speed_motor2;
+
+	    // calculate the value of the command ( in RPM )
+	    command_curr_motor1 = command_prev_motor1 + current_gain * error_curr_motor1 + previous_gain * error_prev_motor1;
+	    command_curr_motor2 = command_prev_motor2 + current_gain * error_curr_motor2 + previous_gain * error_prev_motor2;
+
+	    // convert the command to duty cycle value and write it in the register that stores said value
+	    * PWM_Duty_Value_Register_Motor1 =  (uint16_t)(30 * ((command_curr_motor1 - offset) / slope));
+	    * PWM_Duty_Value_Register_Motor2 =  (uint16_t)(30 * ((command_curr_motor2 - offset) / slope));
+
+	    // update the value of error_prev
+	    error_prev_motor1 = error_curr_motor1;
+	    error_prev_motor2 = error_curr_motor2;
+
+	    // update the value of command_prev
+	    command_prev_motor1 = command_curr_motor1;
+	    command_prev_motor2 = command_curr_motor2;
+
+	    // update count_prev variable with the value of count
+	    count_prev_motor1 = count_motor1;
+	    count_prev_motor2 = count_motor2;
+	}
+}
+
+//Callback for the GPIO Interrupt
+//Executed when the user button is pressed, sending basic commands to the wireless device to check its functionality
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  // User Button ( blue ) is set on the 13th pin of port C
+  if(GPIO_Pin == GPIO_PIN_13)
+  {
+	    // switch clause used for cycling through messages for the wireless device
+        switch(message_nr)
+        {
+        		case 0:
+        		// Test Message, should return OK if everything functions well
+                sprintf(Bluetooth_TX_Buffer,"AT\r\n");
+	            if(HAL_UART_Transmit_IT(&huart3,Bluetooth_TX_Buffer,strlen(Bluetooth_TX_Buffer)) != HAL_OK)
+	            {
+	               Error_Handler();
+	            }
+	            break;
+
+        		case 1:
+        		// Message that returns the name of the wireless device
+        		sprintf(Bluetooth_TX_Buffer,"AT+NAME\r\n");
+                if(HAL_UART_Transmit_IT(&huart3,Bluetooth_TX_Buffer,strlen(Bluetooth_TX_Buffer)) != HAL_OK)
+                {
+                   Error_Handler();
+   	            }
+                break;
+
+        		case 2:
+        		// Message that returns the pin code of the wireless device
+        		sprintf(Bluetooth_TX_Buffer,"AT+PIN\r\n");
+        	    if(HAL_UART_Transmit_IT(&huart3,Bluetooth_TX_Buffer,strlen(Bluetooth_TX_Buffer)) != HAL_OK)
+        		{
+        		   Error_Handler();
+        		}
+        	    break;
+        }
+        // increment the message counter, reset to 0 when it reaches value 3
+        message_nr += 1;
+        if(message_nr == 3)
+        	message_nr = 0;
+  }
+}
+
+// callback for completion of message reception through UART
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	// message received through UART2
+	if(huart->Instance == USART2)
+  	{
+	       // data is being received one byte at a time ( the length of the message is unknown ), so we
+	       // we consider a message as completed if it ends with the '\n' character
+		   if(*(RX_Buffer + RX_Buffer_Index - 1) == '\n')
+		   {
+		      // setting TX_Semaphore so that a the message containing the number of messages sent through
+		      // UART2 is sent to the terminal only after a full message is received
+			   TX_Semaphore = 1;
+
+		      // send the received message to the wireless device
+		      if(HAL_UART_Transmit_IT(&huart3,RX_Buffer,RX_Buffer_Index) != HAL_OK)
+		      {
+		         Error_Handler();
+	          }
+
+		      // loop-back the received message so that we can check its integrity
+		      if(HAL_UART_Transmit_IT(&huart2,RX_Buffer,RX_Buffer_Index) != HAL_OK)
+              {
+		         Error_Handler();
+		      }
+
+		      // reset the buffer index for the buffer containing the received message to 0
+		      RX_Buffer_Index = 0;
+
+	       }
+
+		   // restart data reception
+           if(HAL_UART_Receive_IT(&huart2,RX_Buffer + (RX_Buffer_Index ++),1) != HAL_OK)
+		   {
+	          Error_Handler();
+		   }
+  	}
+
+	// message received through UART3
+	else if(huart->Instance == USART3)
+	{
+
+	       // data is being received one byte at a time ( the length of the message is unknown ), so we
+	       // we consider a message as completed if it ends with the '\n' character ( coming from terminal )
+		   // or with the '%' or 'm' character ( coming from the wireless device )
+		   switch(*(Bluetooth_RX_Buffer + Bluetooth_RX_Buffer_Index - 1))
+		   {
+		   // Message ends with the '\n' character, having the decimal code 10
+		   case '\n':
+			  // send the message received from the wireless device to the terminal for debugging
+			  // purposes
+              if(HAL_UART_Transmit_IT(&huart2,Bluetooth_RX_Buffer,Bluetooth_RX_Buffer_Index) != HAL_OK)
+		      {
+		         Error_Handler();
+	          }
+              // reset the buffer index for the buffer containing the received message to 0
+		      Bluetooth_RX_Buffer_Index = 0;
+		   break;
+
+		   // Message ends with the '%' character, having the decimal code 10
+		   case '%':
+
+			   // in this case, we consider that the received message
+		       // only contains 2 useful bytes and the '%' end-of-message character, those bytes
+		       // representing the duty of the servo-motor controlling the turret, duty ranging from 5 to 10 %,
+               // having a sensibility of 0.1 %
+
+			   // writing the duty value calculated based on the message received through the wireless module in the register responsible
+			   // for setting the duty value of the PWM signal that controls the servo-motor that has the turret attached to it
+			   * PWM_Duty_Value_Register_Turret = ( 10 * ((uint16_t)Bluetooth_RX_Buffer[0]) + ((uint16_t)Bluetooth_RX_Buffer[1]) - 528 ) * 96 + 1200;
+
+			   // reset the buffer index for the buffer containing the received message to 0
+			   Bluetooth_RX_Buffer_Index = 0;
+		   break;
+
+		   // Message ends with the 'm' character, having the decimal code 109
+		   case 'm':
+
+			   // in this case, we consider that the received message only contains 3 useful
+			   // bytes and the 'm' end-of-message character, those bytes representing the
+			   // duty of the PWM signals setting the motor speed and a character that decides
+			   // the direction of the movement: l - left ; r - right ; f - forward ; b - backward ; s - stop
+
+			   // convert data received from terminal into a PWM duty cycle
+			   uint16_t msg_to_duty = 10 * ((uint16_t)Bluetooth_RX_Buffer[0]) + ((uint16_t)Bluetooth_RX_Buffer[1]) - 528;
+			   // if the duty cycle is situated in the linear region of operation, write it in the
+			   // corresponding register ( multiply it by 30 so that it scales with the PWM timer
+			   // period of 3000 ). Otherwise, we set the value of said register to 0 so that we don't
+			   // risk unwanted behavior from the motor.
+
+			   // based on the same observations, we modify the value of the set_speed parameter using the
+			   // first degree analytical relation obtained by linearization
+			   if(msg_to_duty >= 38 && msg_to_duty <= 74)
+			   {
+				  // set the PWM Duty Cycle values to 0 so that no current flows through the
+				  // motor initially to avoid the risk of damaging it
+				  * PWM_Duty_Value_Register_Motor1 = 0;
+				  set_speed_motor1 = 0;
+				  * PWM_Duty_Value_Register_Motor2 = 0;
+			      set_speed_motor2 = 0;
+
+			      // checking the type of movement: forward, backward, left or right
+
+			      // Note: pins 14 and 15 are used for setting/resetting the relays responsible
+			      // for the direction of rotation of the right and, respectively, the left
+			      // motor: reset state means that the motor is moving the tank forward and set
+			      // means that the motor is moving the tank backward
+			      switch(Bluetooth_RX_Buffer[2])
+			      {
+			         // forward
+			         case 'f':
+			        	 direction_1 = 1;
+			        	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+			        	 * PWM_Duty_Value_Register_Motor1 = msg_to_duty * scale_to_period;
+			        	 set_speed_motor1 = ((float)( msg_to_duty )) * slope + offset;
+			        	 direction_2 = 1;
+			        	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+			        	 * PWM_Duty_Value_Register_Motor2 = msg_to_duty * scale_to_period;
+			        	 set_speed_motor2 = ((float)( msg_to_duty )) * slope + offset;
+			         break;
+
+			         // backward
+			      	 case 'b':
+			      	     direction_1 = -1;
+			      	     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+			      	     * PWM_Duty_Value_Register_Motor1 = msg_to_duty * scale_to_period;
+			      	     set_speed_motor1 = ((float)( msg_to_duty )) * slope + offset;
+			      	     direction_2 = -1;
+			      	     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
+			      	     * PWM_Duty_Value_Register_Motor2 = msg_to_duty * scale_to_period;
+			      	     set_speed_motor2 = ((float)( msg_to_duty )) * slope + offset;
+			      	 break;
+
+			      	 // left
+			         case 'l':
+			        	 direction_1 = -1;
+			        	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+			             * PWM_Duty_Value_Register_Motor1 = msg_to_duty * scale_to_period;
+			        	 set_speed_motor1 = ((float)( msg_to_duty )) * slope + offset;
+			        	 direction_2 = 1;
+			        	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+			        	 * PWM_Duty_Value_Register_Motor2 = msg_to_duty * scale_to_period;
+			        	 set_speed_motor2 = ((float)( msg_to_duty )) * slope + offset;
+	     	         break;
+
+	     	         // right
+	     	         case 'r':
+	     	        	 direction_1 = 1;
+	     	        	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+	     	             * PWM_Duty_Value_Register_Motor1 = msg_to_duty * scale_to_period;
+	     	             set_speed_motor1 = ((float)( msg_to_duty )) * slope + offset;
+	     	             direction_2 = -1;
+	     	             HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
+	     	        	 * PWM_Duty_Value_Register_Motor2 = msg_to_duty * scale_to_period;
+	     	        	 set_speed_motor2 = ((float)( msg_to_duty )) * slope + offset;
+	     	         break;
+
+	     	         // stop
+	     	         case 's':
+	     	        	 direction_1 = 1;
+	     	        	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+	     	        	 direction_2 = 1;
+	     	        	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+	     	         break;
+			      }
+			   }
+			   else
+			   {
+				  direction_1 = 1;
+				  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+				  * PWM_Duty_Value_Register_Motor1 = 0;
+		          set_speed_motor1 = 0;
+			      direction_2 = 1;
+			      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+			      * PWM_Duty_Value_Register_Motor2 = 0;
+			      set_speed_motor2 = 0;
+			   }
+		   // reset the buffer index for the buffer containing the received message to 0
+	       Bluetooth_RX_Buffer_Index = 0;
+		   break;
+		   }
+
+		   // restart data reception
+		   if(HAL_UART_Receive_IT(&huart3,Bluetooth_RX_Buffer + (Bluetooth_RX_Buffer_Index ++),1) != HAL_OK)
+		   {
+		      Error_Handler();
+	       }
+
+           // in case the received message is longer than the buffer ( for example AT+HELP\r\n triggers such a response from
+		   // the wireless device ), we reset the buffer index to 0 so that the message doesn't overwrite other memory locations
+		   // and we send the 20 bytes currently present in the buffer to the terminal
+		   if(Bluetooth_RX_Buffer_Index >= 35)
+		   {
+			  Bluetooth_RX_Buffer_Index = 0;
+			  if(HAL_UART_Transmit_IT(&huart2,Bluetooth_RX_Buffer,35) != HAL_OK)
+			  {
+		         Error_Handler();
+			  }
+		   }
+
+	}
+}
+
+// callback for completion of message transmission through UART
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+	// message sent through UART2
+	if(huart->Instance == USART2)
+	{
+	       // only send the message containing the number of sent messages if the semaphore is
+	       // set, so that we know a completed message has been received
+	       if(TX_Semaphore == 1)
+	       {
+	    	  // writing the message containing the number of sent messages in the buffer used
+	    	  // for data transmission
+		      sprintf(TX_Buffer,"\n\rSent messages number :%d\r\n",++nr_sent_messages);
+
+		      //sending the message to the terminal
+		      if(HAL_UART_Transmit_IT(&huart2,TX_Buffer,strlen(TX_Buffer)) != HAL_OK)
+		      {
+		 	     Error_Handler();
+	          }
+
+		      // reseting TX_Semaphore so that no more data is sent to the terminal until another
+		      // full message is received
+		      TX_Semaphore = 0;
+	       }
+	}
+
+	// message sent through UART3
+	else if(huart->Instance == USART3)
+	{
+       // nothing implemented here yet, might be used for expansion in the future
+	}
+
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_USART3_UART_Init();
+  MX_TIM16_Init();
+  MX_TIM6_Init();
+  MX_TIM1_Init();
+  MX_TIM3_Init();
+  MX_TIM14_Init();
+  MX_TIM17_Init();
+  /* USER CODE BEGIN 2 */
+
+  // Start receiving data through UART2 ( Terminal ) in interrupt mode
+  if(HAL_UART_Receive_IT(&huart2,RX_Buffer + (RX_Buffer_Index ++) ,1) != HAL_OK)
+  {
+	  Error_Handler();
+  }
+
+  // Start receiving data through UART3 ( wireless device ) in interrupt mode
+  if(HAL_UART_Receive_IT(&huart3,Bluetooth_RX_Buffer + (Bluetooth_RX_Buffer_Index ++),1) != HAL_OK)
+  {
+  	  Error_Handler();
+  }
+
+  // Starting Timer16 in PWM mode to control the servo-motor moving the turret
+  if(HAL_TIM_PWM_Start(&htim16,TIM_CHANNEL_1) != HAL_OK)
+  {
+	  Error_Handler();
+  }
+
+  // starting Timer14 in PWM mode to control motor1
+  if(HAL_TIM_PWM_Start(&htim14,TIM_CHANNEL_1) != HAL_OK)
+  {
+	  Error_Handler();
+  }
+
+  // starting Timer17 in PWM mode to control motor2
+  if(HAL_TIM_PWM_Start(&htim17,TIM_CHANNEL_1) != HAL_OK)
+  {
+	  Error_Handler();
+  }
+
+  // starting Timer3 in encoder mode for motor1
+  if(HAL_TIM_Encoder_Start(&htim3,TIM_CHANNEL_ALL) != HAL_OK)
+  {
+	  Error_Handler();
+  }
+
+  // starting Timer1 in encoder mode for motor2
+  if(HAL_TIM_Encoder_Start(&htim1,TIM_CHANNEL_ALL) != HAL_OK)
+  {
+	  Error_Handler();
+  }
+
+  // starting Timer 6 in normal mode to be used as a sampling clock
+
+  if(HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
+   {
+ 	  Error_Handler();
+   }
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL6;
+  RCC_OscInitStruct.PLL.PREDIV = RCC_PREDIV_DIV1;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 65535;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI1;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 65535;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI1;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = sampling_period - 1;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 48000;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
+  * @brief TIM14 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM14_Init(void)
+{
+
+  /* USER CODE BEGIN TIM14_Init 0 */
+
+  /* USER CODE END TIM14_Init 0 */
+
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM14_Init 1 */
+
+  /* USER CODE END TIM14_Init 1 */
+  htim14.Instance = TIM14;
+  htim14.Init.Prescaler = 0;
+  htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim14.Init.Period = 3000;
+  htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim14) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim14, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM14_Init 2 */
+
+  /* USER CODE END TIM14_Init 2 */
+  HAL_TIM_MspPostInit(&htim14);
+
+}
+
+/**
+  * @brief TIM16 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM16_Init(void)
+{
+
+  /* USER CODE BEGIN TIM16_Init 0 */
+
+  /* USER CODE END TIM16_Init 0 */
+
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM16_Init 1 */
+
+  /* USER CODE END TIM16_Init 1 */
+  htim16.Instance = TIM16;
+  htim16.Init.Prescaler = 19;
+  htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim16.Init.Period = 48000;
+  htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim16.Init.RepetitionCounter = 0;
+  htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim16) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim16, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim16, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM16_Init 2 */
+
+  /* USER CODE END TIM16_Init 2 */
+  HAL_TIM_MspPostInit(&htim16);
+
+}
+
+/**
+  * @brief TIM17 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM17_Init(void)
+{
+
+  /* USER CODE BEGIN TIM17_Init 0 */
+
+  /* USER CODE END TIM17_Init 0 */
+
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM17_Init 1 */
+
+  /* USER CODE END TIM17_Init 1 */
+  htim17.Instance = TIM17;
+  htim17.Init.Prescaler = 0;
+  htim17.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim17.Init.Period = 3000;
+  htim17.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim17.Init.RepetitionCounter = 0;
+  htim17.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim17) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim17) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim17, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim17, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM17_Init 2 */
+
+  /* USER CODE END TIM17_Init 2 */
+  HAL_TIM_MspPostInit(&htim17);
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 38400;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LD2_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB14 PB15 */
+  GPIO_InitStruct.Pin = GPIO_PIN_14|GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI4_15_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_15_IRQn);
+
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+/* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
